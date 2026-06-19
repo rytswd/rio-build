@@ -103,6 +103,25 @@ impl AmiArch {
     }
 }
 
+/// #58: default to the seedless `ami-dev` flake attrs so the drvPath
+/// (and hence `rio.build/ami` tag) stays stable across rust changes —
+/// `up --wipe` skips the ~2×4 GB coldsnap upload. `RIO_PROD_AMI=1`
+/// restores the seeded prod image (layer-warm baked in).
+fn prod_ami() -> bool {
+    std::env::var_os("RIO_PROD_AMI").is_some_and(|v| v == "1")
+}
+
+/// Flake installable for `t`, dev-suffixed unless [`prod_ami`].
+/// `packages.<sys>.ami` → `packages.<sys>.ami-dev`,
+/// `packages.x86_64-linux.ami-bios` → `…ami-bios-dev`.
+fn pick_installable(t: &Target) -> String {
+    if prod_ami() {
+        t.installable.to_owned()
+    } else {
+        format!("{}-dev", t.installable)
+    }
+}
+
 /// nixpkgs amazon-image.nix writes this at `nix-support/image-info.json`.
 /// Only the fields `register-image` needs are deserialized.
 #[derive(Deserialize)]
@@ -119,8 +138,9 @@ struct ImageInfo {
 /// → same drvPath → same tag. Hashing ALL targets means the tag
 /// changes iff any AMI's content would, including arch-specific
 /// closure changes (e.g. arm firmware) that the x86 drvPath alone
-/// would miss. Called by `up --ami` to find/tag; deploy reads the
-/// tag back from EC2 (`resolve_latest`), not by recomputing.
+/// would miss. Called by `up --ami` to find/tag, and by deploy to set
+/// `karpenter.amiTag` (#58: locally-computed dev/prod tag, not the
+/// EC2 `ami-latest` lookup that mixes dev and prod).
 ///
 /// I-198: was sync `sh::read` — `nix eval` of a NixOS module is
 /// multi-second per arch (×2). `run_read` spawns via tokio::process
@@ -132,7 +152,7 @@ pub async fn ami_tag() -> Result<String> {
     for t in AmiArch::All.targets() {
         // Shell scoped tight so it isn't held across the await
         // (xshell::Shell is !Sync; keeping the future Send-clean).
-        let installable = t.installable;
+        let installable = pick_installable(t);
         let fut = {
             let sh = shell()?;
             run_read(cmd!(sh, "nix eval --raw .#{installable}.drvPath"))
@@ -148,8 +168,8 @@ pub async fn ami_tag() -> Result<String> {
 /// `up --ami` phase entry. Computes the content-addressed tag,
 /// short-circuits if every requested arch already has an AMI tagged
 /// with it, otherwise builds + uploads + registers + tags the missing
-/// ones. Deploy reads the tag from EC2 (`resolve_latest`), not a
-/// handoff file.
+/// ones. Deploy recomputes the same tag via [`ami_tag`] (#58) and
+/// asserts it's registered before rendering it into the EC2NodeClass.
 pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let repo = git::open()?;
     let sha = git::short_sha(&repo)?;
@@ -197,7 +217,7 @@ async fn build_and_register_one(
     cluster: &str,
     t: &Target,
 ) -> Result<()> {
-    let (attr, installable, k8s_arch) = (t.attr, t.installable, t.k8s_arch);
+    let (attr, installable, k8s_arch) = (t.attr, pick_installable(t), t.k8s_arch);
     // Per-target idempotency: a prior partial push (e.g. x86 done,
     // aarch64 interrupted) skips the done one.
     if let Some(existing) = find_existing(ec2, ami_tag, t).await? {
@@ -314,9 +334,12 @@ async fn find_existing(
         .and_then(|i| i.image_id().map(str::to_string)))
 }
 
-/// Latest registered AMI generation, as deploy resolves it: the
-/// content-addressed tag plus the provenance fields deploy validates.
+/// Latest registered AMI generation: the content-addressed tag plus
+/// provenance fields. #58: deploy now recomputes the tag locally
+/// (subsuming the git-sha ancestor check); kept for [`resolve_latest`]
+/// ad-hoc debugging.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct LatestAmi {
     /// `rio.build/ami` — what deploy renders into the EC2NodeClass
     /// amiSelectorTerms.
@@ -342,8 +365,13 @@ pub struct LatestAmi {
 /// nothing (the `assert_registered` guard caught the latter, but the
 /// former silently deployed an old AMI).
 ///
-/// Also returns `rio.build/git-sha` so deploy can check provenance —
-/// see the 2026-06-12 /var/rio outage note at the deploy callsite.
+/// #58: deploy now recomputes the tag locally via [`ami_tag`] (so the
+/// dev/prod variant matches what `up --ami` registered for this
+/// tree), which subsumes the `rio.build/git-sha` ancestor check.
+/// `ami-latest` is still stamped/untagged for human inspection; this
+/// resolver (and the [`LatestAmi`] provenance fields) stays for
+/// ad-hoc debugging.
+#[allow(dead_code)]
 pub async fn resolve_latest(region: &str) -> Result<LatestAmi> {
     let conf = crate::aws::config(Some(region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);

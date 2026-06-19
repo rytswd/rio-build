@@ -73,45 +73,26 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
 
     super::push::assert_in_ecr(tag, &region).await?;
 
-    // ADR-021: NixOS node AMI is the only EC2NodeClass. I-182: resolve
-    // the content-addressed `rio.build/ami` tag from EC2 (newest image
-    // tagged `rio.build/ami-latest=true`, written by `up --ami`) — NOT
-    // from the gitignored per-worktree `.rio-ami-tag` file. A worktree
-    // that never ran `up --ami` previously deployed whatever stale tag
-    // was on disk (or recomputed a drvPath-hash with no backing AMI).
-    // EC2 is the source of truth for "what's actually registered".
-    // assert_registered then confirms BOTH arches exist for that tag —
-    // a half-uploaded set (interrupted `up --ami`) wedges Karpenter.
-    let latest_ami = super::ami::resolve_latest(&region).await?;
-    let ami_tag = latest_ami.tag.as_str();
+    // ADR-021: NixOS node AMI is the only EC2NodeClass. #58: compute
+    // the content-addressed tag locally (dev variant by default, prod
+    // under RIO_PROD_AMI=1) — same drvPath hash `up --ami` registers
+    // under, so a worktree that ran `up --ami` once for this
+    // flake.lock keeps deploying the right tag without re-resolving
+    // `ami-latest` from EC2 (which can point at a prod tag after a
+    // dev/prod interleave). assert_registered then confirms ALL
+    // (arch,boot) tuples exist for that tag — wrong/missing → loud
+    // error, never a wedged Karpenter.
+    //
+    // This subsumes the former git-sha ancestor check (2026-06-12
+    // /var/rio outage): `ami-latest` could resolve to an AMI from a
+    // foreign/stale tree, so deploy verified `rio.build/git-sha` was
+    // an ancestor of HEAD. With the tag derived from THIS tree's
+    // drvPaths, a foreign-tree AMI cannot match — assert_registered
+    // either finds the AMI built from this exact module config, or it
+    // fails closed with the `up --ami` remedy.
+    let ami_tag = super::ami::ami_tag().await?;
+    let ami_tag = ami_tag.as_str();
     super::ami::assert_registered(ami_tag, &region).await?;
-
-    // AMI provenance (2026-06-12 /var/rio outage): `ami-latest` is
-    // stamped by whichever worktree last ran `up --ami`. An AMI built
-    // from a stale tree predating the /var/rio provisioning
-    // (rio-{ebs,nvme}-mount + tmpfiles, nix/nixos-node/eks-node.nix)
-    // got resolved here; every builder node it booted joined without
-    // /var/rio, so builder + rio-mountd pods sat in ContainerCreating
-    // on kubelet hostPath type-check failures until the health reaper
-    // replaced the nodes. Require the AMI's source commit to be in the
-    // deploying HEAD's history. The remedy is cheap when the AMI
-    // inputs didn't actually change: the content-addressed tag makes
-    // `up --ami` skip the build/upload and just re-tag.
-    let ami_sha = latest_ami.git_sha.as_deref().with_context(|| {
-        format!(
-            "AMI {} (rio.build/ami={ami_tag}) has no rio.build/git-sha tag — \
-             retag via `cargo xtask k8s -p eks up --ami`",
-            latest_ami.image_id
-        )
-    })?;
-    anyhow::ensure!(
-        git::is_ancestor_of_head(ami_sha).await?,
-        "AMI {} (rio.build/ami={ami_tag}) was built from commit {ami_sha}, which is not an \
-         ancestor of the deploying HEAD — it comes from a foreign or rewritten-away tree and \
-         may lack node provisioning this chart depends on (e.g. the /var/rio units). \
-         Run `cargo xtask k8s -p eks up --ami` from this worktree first.",
-        latest_ami.image_id
-    );
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;

@@ -75,6 +75,11 @@ pub fn image_tag(repo: &gix::Repository) -> Result<String> {
 /// never seen. The last two both mean "not our history" — a foreign
 /// or rewritten-away commit is exactly what the caller wants to
 /// reject — so any non-zero status maps to `false`.
+///
+/// #58: deploy's only callsite was the `rio.build/git-sha` ancestor
+/// check, which the locally-recomputed [`ami_tag`](crate::k8s::eks::ami::ami_tag)
+/// subsumes. Kept for ad-hoc debugging.
+#[allow(dead_code)]
 pub async fn is_ancestor_of_head(sha: &str) -> Result<bool> {
     let is_hex_oid = (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
     if !is_hex_oid {
