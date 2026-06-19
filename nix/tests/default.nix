@@ -266,9 +266,21 @@ let
     fixture = k3sFull {
       jwtEnabled = true;
       defaultTenant = "vmtest";
+      singleNode = true;
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-pull-canary.yaml
       ];
+    };
+  };
+  # issue #57 1b: single-node variant for the lifecycle splits that
+  # don't assert multi-node behaviour. recovery stays on lifecycleMod
+  # (two-node) — its store-rollout subtest churns pods across nodes.
+  lifecycleModSingle = lifecycle {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      defaultTenant = "vmtest";
+      singleNode = true;
     };
   };
 
@@ -285,6 +297,8 @@ let
   # KEDA closed loop is EKS-only (no operator in the airgapped image
   # set) — the scenario drives the same actuation via kubectl scale;
   # see the scenario header for the disclosed VM-scale limits.
+  # NOT singleNode: replicas=2 + the standby Trailers-Only posture is
+  # the test's premise; singleNode forces scheduler.replicas=1.
   standbyBurstMod = standby-burst {
     inherit pkgs common;
     fixture = k3sFull { defaultTenant = "vmtest"; };
@@ -440,7 +454,7 @@ let
   # ── materialize-failover scenario builder (T-3.3) ───────────────────
   # Materialization under leader failover on the k3s fixture (2
   # scheduler replicas per vmtest-full.yaml — the failover needs a
-  # standby).
+  # standby). NOT singleNode for the same reason.
   materializeFailoverTest = materialize-failover {
     inherit pkgs common;
     fixture = k3sFull {
@@ -460,6 +474,7 @@ let
   substituteScaleTest = substitute-scale {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       jwtEnabled = true;
       defaultTenant = "vmtest";
       extraValuesTyped = {
@@ -1102,6 +1117,7 @@ in
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
+      singleNode = true;
       # P0560 stopgap: the e2e build's inputs go through the
       # tenant-scoped castore reads — see the k3s-full.nix
       # defaultTenant comment.
@@ -1170,7 +1186,7 @@ in
   #
   # P0294: ctrlrestart + reconnect splits removed (Build CRD rip).
   # build-crd-flow + build-crd-errors dropped from core.
-  vm-lifecycle-core-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-core-k3s = lifecycleModSingle.mkTest {
     name = "core";
     subtests = [
       # r[verify sec.jwt.pubkey-mount+2]
@@ -1214,7 +1230,7 @@ in
   # the tail of the pipeline's critical path. Both fragments build
   # their own paths (no shared state with core's remaining subtests),
   # so the split costs one more k3s boot and nothing else.
-  vm-lifecycle-gc-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-gc-k3s = lifecycleModSingle.mkTest {
     name = "gc";
     subtests = [
       "gc-dry-run"
@@ -1270,7 +1286,7 @@ in
     ];
   };
 
-  vm-lifecycle-autoscale-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-autoscale-k3s = lifecycleModSingle.mkTest {
     name = "autoscale";
     subtests = [
       # r[verify ctrl.pool.ephemeral+2]
@@ -1388,6 +1404,7 @@ in
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       extraImages = kwok.airgapImages;
       extraManifests = kwok.manifests;
       extraValuesTyped = {
@@ -1569,6 +1586,7 @@ in
   vm-wipe-burst-k3s = wipe-burst {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       jwtEnabled = true;
       defaultTenant = "vmtest";
       extraValuesTyped = {
@@ -1690,7 +1708,7 @@ in
   # AdminService. ~5min (mostly k3s bring-up).
   vm-cli-k3s = cli {
     inherit pkgs common;
-    fixture = k3sFull { };
+    fixture = k3sFull { singleNode = true; };
   };
 
   # r[verify dash.envoy.grpc-web-translate+3]
@@ -1738,6 +1756,7 @@ in
   vm-dashboard-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       gatewayEnabled = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
@@ -1788,6 +1807,9 @@ in
   # r[verify sec.transport.cilium-wireguard]
   # r[verify gw.ingress.v6-direct]
   # r[verify gw.ingress.v4-via-nat]
+  # NOT singleNode: ingress-v4v6 imports cilium-encrypt.nix whose
+  # `wg show cilium_wg0` assertion needs inter-node WireGuard — with
+  # one k3s node there is no peer and the tunnel never comes up.
   vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
     fixture = k3sFull {
