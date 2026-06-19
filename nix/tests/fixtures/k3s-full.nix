@@ -67,6 +67,7 @@ let
         ;
     };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
+  mkContainerdSeed = import ../../containerd-seed.nix { inherit pkgs; };
   ciliumImages = [
     pulled.cilium-agent
     pulled.cilium-operator-generic
@@ -176,6 +177,15 @@ in
   # gate. The two-node path is unchanged for le-*, lifecycle-recovery,
   # netpol, fetcher-split, prod-parity.
   singleNode ? false,
+  # issue #57 1f: pre-import the airgap image set at BUILD time
+  # (nix/containerd-seed.nix) instead of letting k3s's serial pre-kubelet
+  # goroutine do it at boot. The seed's content store is loop-mounted
+  # erofs overlaid under containerd's content dir + meta.db copied into
+  # place before k3s starts; `services.k3s.images` is emptied. Same
+  # mechanism class as r[infra.node.prebake-layer-warm]. Gated off by
+  # default while the lazy-unpack path is proven on one test (vm-cli-k3s);
+  # flip per-test in nix/tests/default.nix.
+  withContainerdSeed ? false,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -271,6 +281,19 @@ let
   # mode vmTestsCov skips it entirely.
   ++ pkgs.lib.optional (gatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
   ++ extraImages;
+
+  # Full airgap set for THIS scenario variant (varies with extraImages /
+  # gatewayEnabled). When withContainerdSeed=false this feeds
+  # `services.k3s.images` on both nodes (the historical path). When
+  # withContainerdSeed=true it feeds mkContainerdSeed instead and
+  # `services.k3s.images` is emptied — see nix/containerd-seed.nix
+  # header for the runtime mount sequence.
+  airgapImageSet = [ k3sPinned.airgap-images ] ++ rioImages ++ ciliumImages;
+  containerdSeed = mkContainerdSeed {
+    name = "k3s-full";
+    images = airgapImageSet;
+  };
+  containerdRoot = "/var/lib/rancher/k3s/agent/containerd";
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
   # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
@@ -417,7 +440,7 @@ let
         # (nix/nixos-node/hardening.nix).
         "fuse.enable_uring=1"
       ];
-      supportedFilesystems = [ "xfs" ];
+      supportedFilesystems = [ "xfs" ] ++ pkgs.lib.optional withContainerdSeed "erofs";
     };
 
     # ── /var/rio on an XFS-with-prjquota loopback ──────────────────────
@@ -497,6 +520,43 @@ let
       ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
     };
 
+    # issue #57 1f: mount the pre-imported content store + drop meta.db
+    # into place BEFORE k3s starts its embedded containerd. The parent
+    # ${containerdRoot} tmpfs is stage-1 (neededForBoot below), so by
+    # the time this oneshot runs the upper/work dirs can be mkdir'd on
+    # it. erofs loop-mount → ro lower; overlay upper stays ~empty
+    # (content store is append-only, airgapped test pulls nothing).
+    # meta.db is a plain copy onto tmpfs — boltdb opens O_RDWR+mmap,
+    # which would copy-up through an overlay anyway.
+    #
+    # Own NixOS-module attrset (not a third `services.*` key inside the
+    # `systemd = {…}` block above): statix W:20 flags 3+ repeated keys.
+    # Module merging composes the two systemd.services maps anyway.
+    systemd.services.containerd-seed-mount = pkgs.lib.mkIf withContainerdSeed {
+      before = [ "k3s.service" ];
+      requiredBy = [ "k3s.service" ];
+      after = [ "local-fs.target" ];
+      unitConfig.DefaultDependencies = false;
+      path = [ pkgs.util-linux ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+        root=${containerdRoot}
+        content=$root/io.containerd.content.v1.content
+        mkdir -p /run/containerd-seed/lower $content \
+          $root/.content-upper $root/.content-work \
+          $root/io.containerd.metadata.v1.bolt
+        mount -t erofs -o loop,ro \
+          ${containerdSeed}/content.erofs /run/containerd-seed/lower
+        mount -t overlay overlay $content -o \
+          lowerdir=/run/containerd-seed/lower,upperdir=$root/.content-upper,workdir=$root/.content-work
+        cp ${containerdSeed}/meta.db $root/io.containerd.metadata.v1.bolt/meta.db
+      '';
+    };
+
     networking.firewall = {
       allowedTCPPorts = [
         6443 # apiserver (server only, but opening on agent is a no-op)
@@ -553,7 +613,7 @@ let
     # virtualisation.fileSystems (not plain fileSystems): qemu-vm.nix
     # does `fileSystems = mkVMOverride virtualisation.fileSystems`
     # (priority 10) — a plain `fileSystems.*` def is silently dropped.
-    virtualisation.fileSystems."/var/lib/rancher/k3s/agent/containerd" = {
+    virtualisation.fileSystems.${containerdRoot} = {
       fsType = "tmpfs";
       neededForBoot = true;
       options = [
@@ -610,7 +670,10 @@ let
         role = "server";
         clusterInit = true;
         inherit tokenFile;
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # withContainerdSeed: images already registered via the
+        # containerd-seed-mount oneshot above; an empty list makes k3s's
+        # serial pre-kubelet airgap goroutine return immediately.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         manifests = {
           # Cilium CNI — applied first (filename-alphabetical: `000-` sorts
           # before everything). Nothing else can schedule until cilium-agent
@@ -796,8 +859,9 @@ let
         serverAddr = "https://[${nodes.k3s-server.networking.primaryIPv6Address}]:6443";
         # Agent loads images into its OWN containerd. Pods scheduled
         # here need local images — this is where the second scheduler
-        # replica (antiAffinity) + maybe workers land.
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # replica (antiAffinity) + maybe workers land. withContainerdSeed:
+        # k3sBase's containerd-seed-mount already registered them.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         extraFlags = [
           "--node-ip"
           config.networking.primaryIPv6Address
